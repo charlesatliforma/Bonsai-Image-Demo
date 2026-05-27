@@ -136,12 +136,62 @@ try {
 
 $wall = [int]((Get-Date) - $t0).TotalSeconds
 
+$metaScript = @'
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+demo_dir = Path(sys.argv[1]).resolve()
+model, prompt = sys.argv[2], sys.argv[3]
+seed, steps = int(sys.argv[4]), int(sys.argv[5])
+width, height = int(sys.argv[6]), int(sys.argv[7])
+wall_s = float(sys.argv[8])
+output = Path(sys.argv[9]).expanduser().resolve()
+
+meta_dir = demo_dir / "outputs" / model
+meta_dir.mkdir(parents=True, exist_ok=True)
+meta_path = meta_dir / "generations.json"
+
+try:
+    rel_output = output.relative_to(demo_dir)
+except ValueError:
+    rel_output = output
+
+record = {
+    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "model": model,
+    "prompt": prompt,
+    "seed": seed,
+    "width": width,
+    "height": height,
+    "steps": steps,
+    "duration_seconds": round(wall_s, 3),
+    "output": str(rel_output),
+}
+
+if meta_path.exists():
+    try:
+        existing = json.loads(meta_path.read_text())
+        if not isinstance(existing, list):
+            existing = []
+    except json.JSONDecodeError:
+        existing = []
+else:
+    existing = []
+
+existing.append(record)
+meta_path.write_text(json.dumps(existing, indent=2) + "\n")
+print(meta_path)
+'@
+$MetaPath = & $venvPy -c $metaScript $DemoDir $modelLabel $Prompt $Seed $Steps $Width $Height $wall $Output
+
 Write-Host ""
 Write-Host "  prompt: $Prompt"
 Write-Host "  seed:   $Seed"
 Write-Host "  size:   ${Width}x${Height}"
 Write-Host "  wall:   ${wall}s"
 Write-Host "  path:   $Output"
+Write-Host "  meta:   $MetaPath"
 
 if ($Open) {
     Invoke-Item $Output

@@ -127,12 +127,61 @@ if [ "$_http" != "200" ]; then
     exit 1
 fi
 
+_meta_path=$("$DEMO_DIR/.venv/bin/python" -c '
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+demo_dir = Path(sys.argv[1]).resolve()
+model, prompt = sys.argv[2], sys.argv[3]
+seed, steps = int(sys.argv[4]), int(sys.argv[5])
+width, height = int(sys.argv[6]), int(sys.argv[7])
+wall_s = float(sys.argv[8])
+output = Path(sys.argv[9]).expanduser().resolve()
+
+meta_dir = demo_dir / "outputs" / model
+meta_dir.mkdir(parents=True, exist_ok=True)
+meta_path = meta_dir / "generations.json"
+
+try:
+    rel_output = output.relative_to(demo_dir)
+except ValueError:
+    rel_output = output
+
+record = {
+    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "model": model,
+    "prompt": prompt,
+    "seed": seed,
+    "width": width,
+    "height": height,
+    "steps": steps,
+    "duration_seconds": round(wall_s, 3),
+    "output": str(rel_output),
+}
+
+if meta_path.exists():
+    try:
+        existing = json.loads(meta_path.read_text())
+        if not isinstance(existing, list):
+            existing = []
+    except json.JSONDecodeError:
+        existing = []
+else:
+    existing = []
+
+existing.append(record)
+meta_path.write_text(json.dumps(existing, indent=2) + "\n")
+print(meta_path)
+' "$DEMO_DIR" "$_model_label" "$_prompt" "$_seed" "$_steps" "$_width" "$_height" "$_wall" "$_output")
+
 echo
 echo "  prompt: $_prompt"
 echo "  seed:   $_seed"
 echo "  size:   ${_width}x${_height}"
 echo "  wall:   ${_wall}s"
 echo "  path:   $_output"
+echo "  meta:   $_meta_path"
 
 if [ "$_open" = 1 ] && [ "$(uname -s)" = "Darwin" ]; then
     open "$_output" 2>/dev/null || true
