@@ -354,9 +354,11 @@ info "mflux installed (versions <= $_pkg_cutoff)."
 # to swap whenever a 1-bit model is already present under models/. Binary users
 # who run setup before downloading a model should export BONSAI_VARIANT=binary.
 _variant="${BONSAI_VARIANT:-ternary}"
-for _bin_model in "$SCRIPT_DIR"/models/bonsai-image-4B-binary-*; do
-    [ -d "$_bin_model" ] && _variant="binary" && break
-done
+if [ -z "${BONSAI_VARIANT:-}" ]; then
+    for _bin_model in "$SCRIPT_DIR"/models/bonsai-image-4B-binary-*; do
+        [ -d "$_bin_model" ] && _variant="binary" && break
+    done
+fi
 
 # bf16 GPU-vs-CPU matmul check: exit 0 if the GPU kernel is correct (reldiff
 # < 0.1), 1 if it's miscompiled (the M5 NAX bug gives reldiff ~1.1).
