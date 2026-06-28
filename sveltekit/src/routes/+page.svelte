@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import SimpleVoiceGraphic from '$lib/components/SimpleVoiceGraphic.svelte';
+  import { createPlaybackMeter } from '$lib/audio-playback-meter';
   import { readViewMode, writeViewMode, type ViewMode } from '$lib/view-mode-store';
   import { clearSession, loadSession, saveSession } from '$lib/conversation-store';
   import { clearSystemPrompt, readSystemPrompt, writeSystemPrompt } from '$lib/system-prompt-store';
@@ -80,6 +81,12 @@
   let pendingUtterance = '';
   let assistantDraft = '';
   let audioEl: HTMLAudioElement | null = null;
+  const playbackMeter = createPlaybackMeter();
+  const speechAudioLevel = {
+    get current() {
+      return playbackMeter.readLevel();
+    },
+  };
   let recognitionActive = false;
   let isThinkingFlag = false;
   let isSpeakingFlag = false;
@@ -320,6 +327,7 @@
 
   function finishSpeaking() {
     clearSegmentPauseTimer();
+    playbackMeter.disconnect();
     isSpeakingFlag = false;
     isSpeaking = false;
     speechSegments = [];
@@ -541,7 +549,7 @@
     }
   }
 
-  function playAudioBlob(audio: ArrayBuffer, mimeType: string) {
+  async function playAudioBlob(audio: ArrayBuffer, mimeType: string) {
     if (!isSpeaking) return;
 
     const generation = playbackGeneration;
@@ -549,6 +557,7 @@
     const url = URL.createObjectURL(blob);
     const audioNode = new Audio(url);
     audioEl = audioNode;
+    await playbackMeter.connect(audioNode);
     audioNode.onended = () => {
       if (generation !== playbackGeneration) {
         URL.revokeObjectURL(url);
@@ -578,7 +587,17 @@
       speechSegments.length > 1
         ? `Playing part ${speechSegmentIndex + 1} of ${speechSegments.length}...`
         : 'Playing reply.';
-    void audioNode.play();
+    try {
+      await audioNode.play();
+    } catch {
+      URL.revokeObjectURL(url);
+      if (generation !== playbackGeneration) return;
+      error = 'Could not play the Supertonic audio.';
+      finishSpeaking();
+      if (resumeListeningAfterSpeak && conversationActive) {
+        setTimeout(startRecognition, POST_TTS_COOLDOWN_MS);
+      }
+    }
   }
 
   function handleTts(event: MessageEvent<SupertonicWorkerMessage>) {
@@ -637,6 +656,7 @@
     stopRecognition();
     audioEl?.pause();
     audioEl = null;
+    playbackMeter.disconnect();
     bonsaiWorker?.postMessage({ type: 'reset' });
     turns = [];
     interim = '';
@@ -810,6 +830,7 @@
       recognitionActive = false;
       recognition?.abort();
       audioEl?.pause();
+      playbackMeter.destroy();
       bonsaiWorker?.terminate();
       ttsWorker?.terminate();
       bonsaiWorker = null;
@@ -877,7 +898,7 @@
           {:else if isLoadingModels}
             <p class="simple-caption">Loading models…</p>
           {/if}
-          <SimpleVoiceGraphic mode={simpleGraphicMode} />
+          <SimpleVoiceGraphic mode={simpleGraphicMode} audioLevelSource={speechAudioLevel} />
         </div>
         {#if error}
           <p class="alert simple-alert">{error}</p>

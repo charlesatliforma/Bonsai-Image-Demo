@@ -3,13 +3,20 @@
 
   export type GraphicMode = 'loading' | 'speaking' | 'thinking' | 'waiting';
 
-  let { mode = 'waiting' }: { mode?: GraphicMode } = $props();
+  export type AudioLevelSource = { current: number };
+
+  let {
+    mode = 'waiting',
+    audioLevelSource,
+  }: { mode?: GraphicMode; audioLevelSource?: AudioLevelSource } = $props();
 
   let canvas: HTMLCanvasElement | undefined = $state();
   const modeRef: { current: GraphicMode } = { current: 'waiting' };
+  const audioLevelHolder: { source: AudioLevelSource } = { source: { current: 0 } };
 
   $effect(() => {
     modeRef.current = mode;
+    audioLevelHolder.source = audioLevelSource ?? audioLevelHolder.source;
   });
 
   const SPEEDS: Record<GraphicMode, number> = {
@@ -68,6 +75,7 @@
     let angle = 0;
     let speed = SPEEDS.waiting;
     let energy = ENERGY.waiting;
+    let volumeScale = 1;
     let breathe = 0;
     let shimmer = 0;
     let last = performance.now();
@@ -141,15 +149,25 @@
       last = now;
 
       const mode = modeRef.current;
+      const audioLevel = mode === 'speaking' ? audioLevelHolder.source.current : 0;
+
       const targetSpeed = SPEEDS[mode];
       const targetEnergy = ENERGY[mode];
+      const targetScale = mode === 'speaking' ? 0.58 + audioLevel * 0.72 : 1;
+
       speed += (targetSpeed - speed) * Math.min(1, dt * 3.2);
       energy += (targetEnergy - energy) * Math.min(1, dt * 2.8);
+      volumeScale += (targetScale - volumeScale) * Math.min(1, dt * 14);
       angle += speed * dt;
       breathe += dt * (0.65 + speed * 0.14);
       shimmer += dt * (1.2 + speed * 0.25);
 
       ctx.clearRect(0, 0, size, size);
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(volumeScale, volumeScale);
+      ctx.translate(-cx, -cy);
 
       // Ambient bloom
       const pulse = 0.55 + Math.sin(breathe) * 0.12;
@@ -250,6 +268,8 @@
           ctx.stroke();
         }
       }
+
+      ctx.restore();
 
       frameId = requestAnimationFrame(tick);
     };
