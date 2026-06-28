@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import SimpleVoiceGraphic from '$lib/components/SimpleVoiceGraphic.svelte';
+  import { readViewMode, writeViewMode, type ViewMode } from '$lib/view-mode-store';
   import { clearSession, loadSession, saveSession } from '$lib/conversation-store';
   import { clearSystemPrompt, readSystemPrompt, writeSystemPrompt } from '$lib/system-prompt-store';
   import {
@@ -12,7 +14,10 @@
     SPEECH_BREAK_OPTIONS,
     TTS_LANGUAGE_GROUPS,
     buildWorkerMessages,
+    needsOpeningGreeting,
+    buildOpeningWorkerMessages,
     formatWorkerMessagesForDisplay,
+    normaliseAssistantOutput,
     formatPostProcessedTtsText,
     getLlmPromptForTurn,
     splitForSupertonicWithMode,
@@ -44,7 +49,7 @@
   let loadedModelId = $state<ModelId | null>(null);
   let ttsReady = $state(false);
   let status = $state('Load models to begin listening.');
-  let ttsStatus = $state('Supertonic loads together with Bonsai.');
+  let ttsStatus = $state('Supertonic loads with the language model.');
   let interim = $state('');
   let isListening = $state(false);
   let isLoadingModels = $state(false);
@@ -56,9 +61,17 @@
   let speechSupported = $state(true);
   let speakingTurnId = $state<string | null>(null);
   let sessionHydrated = $state(false);
+  let workersReady = $state(false);
+  let viewMode = $state<ViewMode>('simple');
 
   const selectedModel = $derived(MODELS.find((m) => m.id === modelId) ?? MODELS[0]);
   const isReady = $derived(loadedModelId === modelId && ttsReady && !isLoadingModels);
+  const simpleGraphicMode = $derived.by(() => {
+    if (isLoadingModels) return 'loading' as const;
+    if (isSpeaking) return 'speaking' as const;
+    if (isThinking) return 'thinking' as const;
+    return 'waiting' as const;
+  });
 
   let bonsaiWorker: Worker | null = null;
   let ttsWorker: Worker | null = null;
@@ -117,7 +130,7 @@
   });
 
   $effect(() => {
-    if (!sessionHydrated) return;
+    if (!sessionHydrated || viewMode === 'simple') return;
     turns;
     speechBreak;
     modelId;
@@ -137,6 +150,19 @@
     writeSystemPrompt(DEFAULT_SYSTEM_PROMPT);
   }
 
+  async function setViewMode(mode: ViewMode) {
+    viewMode = mode;
+    writeViewMode(mode);
+    if (mode === 'simple') {
+      await resetConversationState(true);
+      loadedModelId = null;
+      ttsReady = false;
+      isLoadingModels = false;
+      status = 'Load models to begin listening.';
+      ttsStatus = 'Supertonic loads with the language model.';
+    }
+  }
+
   function schedulePersist() {
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
@@ -151,6 +177,27 @@
   }
 
   async function hydrateSession() {
+    if (viewMode === 'simple') {
+      await clearSession();
+      turns = [];
+      conversationActive = false;
+      interim = '';
+      pendingUtterance = '';
+      activeTurnId = null;
+      speakingTurnId = null;
+      assistantDraft = '';
+      lastAssistantOutput = '';
+
+      const storedPrompt = readSystemPrompt();
+      if (storedPrompt !== null) {
+        systemPrompt = storedPrompt;
+      } else {
+        writeSystemPrompt(systemPrompt);
+      }
+      sessionHydrated = true;
+      return;
+    }
+
     const saved = await loadSession();
     if (saved) {
       turns = saved.turns;
@@ -178,7 +225,7 @@
   }
 
   async function persistSession() {
-    if (!sessionHydrated) return;
+    if (!sessionHydrated || viewMode === 'simple') return;
     if (persistInFlight) {
       persistQueued = true;
       return;
@@ -360,6 +407,46 @@
     beginSpeaking(turn.assistantText, conversationActive, turn.id);
   }
 
+  function sendOpeningMessage(): boolean {
+    if (!isReady || isThinking || isSpeaking || !bonsaiWorker) return false;
+    if (!needsOpeningGreeting(turns)) return false;
+
+    clearPauseTimer();
+    pendingUtterance = '';
+    interim = '';
+    isThinkingFlag = true;
+    stopRecognition();
+    error = null;
+    isThinking = true;
+    assistantDraft = '';
+    status = 'Thinking...';
+
+    const existingOpening = turns.find((turn) => !turn.userText.trim() && !turn.assistantText.trim());
+    const turnId = existingOpening?.id ?? messageId('turn');
+    activeTurnId = turnId;
+
+    const workerPayload = buildOpeningWorkerMessages(systemPromptSnapshot);
+    const llmPrompt = formatWorkerMessagesForDisplay(workerPayload);
+
+    if (existingOpening) {
+      turns = turns.map((turn) =>
+        turn.id === turnId ? { ...turn, llmPrompt, assistantText: '' } : turn,
+      );
+    } else {
+      turns = [
+        ...turns,
+        { id: turnId, userText: '', assistantText: '', llmPrompt },
+      ];
+    }
+
+    bonsaiWorker.postMessage({ type: 'reset' });
+    bonsaiWorker.postMessage({
+      type: 'generate',
+      data: workerPayload,
+    });
+    return true;
+  }
+
   function sendUtterance(rawText: string) {
     const text = rawText.trim();
     if (!text || isThinkingFlag || isSpeakingFlag || !isReadyFlag) return;
@@ -379,7 +466,7 @@
     error = null;
     isThinking = true;
     assistantDraft = '';
-    status = 'Bonsai is thinking...';
+    status = 'Thinking...';
 
     const turnId = messageId('turn');
     activeTurnId = turnId;
@@ -407,10 +494,10 @@
     const message = event.data;
     switch (message.status) {
       case 'progress_total':
-        status = `Downloading Bonsai ${formatBytes(message.loaded)} / ${formatBytes(message.total)}`;
+        status = `Downloading model ${formatBytes(message.loaded)} / ${formatBytes(message.total)}`;
         break;
       case 'loading':
-        status = message.data ?? 'Loading Bonsai...';
+        status = message.data ?? 'Loading model...';
         break;
       case 'ready':
         loadedModelId = modelId;
@@ -427,16 +514,16 @@
         if (message.tps != null) tokensPerSecond = message.tps;
         if (!message.output) break;
         assistantDraft += message.output;
-        updateActiveTurnAssistant(assistantDraft);
+        updateActiveTurnAssistant(normaliseAssistantOutput(assistantDraft));
         break;
       case 'complete': {
-        const output = assistantDraft.trim() || message.output?.trim() || '';
+        const output = normaliseAssistantOutput(assistantDraft.trim() || message.output?.trim() || '');
         const completedTurnId = activeTurnId;
         updateActiveTurnAssistant(output);
         activeTurnId = null;
         isThinkingFlag = false;
         isThinking = false;
-        status = 'Bonsai answered. Speaking...';
+        status = 'Speaking...';
         void persistSession();
         speak(output, completedTurnId);
         break;
@@ -447,7 +534,7 @@
         isThinkingFlag = false;
         isThinking = false;
         activeTurnId = null;
-        error = message.data ?? 'Bonsai reported an error.';
+        error = message.data ?? 'The language model reported an error.';
         status = 'Error.';
         if (conversationActive) startRecognition();
         break;
@@ -544,23 +631,73 @@
     }
   }
 
-  function loadModels() {
+  async function resetConversationState(clearStorage = true) {
+    conversationActive = false;
+    resumeListeningAfterSpeak = false;
+    stopRecognition();
+    audioEl?.pause();
+    audioEl = null;
+    bonsaiWorker?.postMessage({ type: 'reset' });
+    turns = [];
+    interim = '';
+    pendingUtterance = '';
+    error = null;
+    isThinkingFlag = false;
+    isSpeaking = false;
+    isSpeakingFlag = false;
+    isThinking = false;
+    tokensPerSecond = null;
+    lastAssistantOutput = '';
+    activeTurnId = null;
+    speakingTurnId = null;
+    assistantDraft = '';
+    playbackGeneration += 1;
+    speechSegments = [];
+    speechSegmentIndex = 0;
+    clearPauseTimer();
+    clearSegmentPauseTimer();
+    if (clearStorage) {
+      await clearSession();
+    }
+  }
+
+  async function loadModels() {
+    if (!bonsaiWorker || !ttsWorker) {
+      error = 'Workers are still starting. Try again in a moment.';
+      return;
+    }
+    if (viewMode === 'simple') {
+      await resetConversationState(true);
+    }
     error = null;
     isLoadingModels = true;
     loadedModelId = null;
     ttsReady = false;
     status = `Loading ${selectedModel.name}...`;
     ttsStatus = 'Loading Supertonic...';
-    bonsaiWorker?.postMessage({ type: 'load', data: modelId });
-    ttsWorker?.postMessage({ type: 'load' });
+    bonsaiWorker.postMessage({ type: 'load', data: modelId });
+    ttsWorker.postMessage({ type: 'load' });
   }
 
   function startConversation() {
     if (!speechSupported || !isReady) return;
     conversationActive = true;
     error = null;
-    status = 'Listening...';
-    startRecognition();
+    if (needsOpeningGreeting(turns)) {
+      if (!sendOpeningMessage()) {
+        status = 'Listening...';
+        startRecognition();
+      }
+    } else {
+      status = 'Listening...';
+      startRecognition();
+    }
+  }
+
+  function requestOpeningIfNeeded() {
+    if (!conversationActive || !needsOpeningGreeting(turns)) return;
+    if (isThinking || isSpeaking) return;
+    sendOpeningMessage();
   }
 
   function stopConversation() {
@@ -572,28 +709,15 @@
   }
 
   async function restartConversation() {
-    conversationActive = false;
-    stopRecognition();
-    audioEl?.pause();
-    bonsaiWorker?.postMessage({ type: 'reset' });
-    turns = [];
-    interim = '';
-    error = null;
-    isThinkingFlag = false;
-    isSpeaking = false;
-    isSpeakingFlag = false;
-    isThinking = false;
-    tokensPerSecond = null;
-    lastAssistantOutput = '';
-    activeTurnId = null;
-    speakingTurnId = null;
-    playbackGeneration += 1;
-    speechSegments = [];
-    speechSegmentIndex = 0;
-    clearSegmentPauseTimer();
-    await clearSession();
-    await persistSession();
-    status = isReady ? `${selectedModel.name} + Supertonic ready.` : 'Load models to begin listening.';
+    await resetConversationState(true);
+    if (viewMode !== 'simple') {
+      await persistSession();
+    }
+    if (isReady && speechSupported) {
+      startConversation();
+    } else {
+      status = isReady ? `${selectedModel.name} + Supertonic ready.` : 'Load models to begin listening.';
+    }
     ttsStatus = ttsReady ? 'Supertonic ready.' : ttsStatus;
   }
 
@@ -601,6 +725,11 @@
     const storedPrompt = readSystemPrompt();
     if (storedPrompt !== null) {
       systemPrompt = storedPrompt;
+    }
+
+    const storedViewMode = readViewMode();
+    if (storedViewMode !== null) {
+      viewMode = storedViewMode;
     }
 
     const handleBeforeUnload = () => {
@@ -616,7 +745,11 @@
       ttsWorker = new Worker(SUPERTONIC_WORKER_URL, { type: 'module' });
       bonsaiWorker.addEventListener('message', handleBonsai);
       ttsWorker.addEventListener('message', handleTts);
+      workersReady = true;
       bonsaiWorker.postMessage({ type: 'check' });
+      if (conversationActive) {
+        requestOpeningIfNeeded();
+      }
     })();
 
     const Recognition = getSpeechRecognition();
@@ -686,17 +819,74 @@
 </script>
 
 <svelte:head>
-  <title>Bonsai · Speech to speech</title>
+  <title>Speech to speech</title>
 </svelte:head>
 
-<main class="page">
-  <div class="container">
-    <header class="hero">
-      <p class="eyebrow">Speech to speech</p>
-      <h1>Talk to Bonsai</h1>
-      <p class="lede">Browser-only Bonsai LLM + Supertonic TTS. Conversation is saved locally in IndexedDB.</p>
-    </header>
+<main class="app">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+        </span>
+        <div class="brand-copy">
+          <span class="brand-name">Speech</span>
+          <span class="brand-tagline">Speech to speech</span>
+        </div>
+      </div>
+      <div class="view-toggle" role="tablist" aria-label="View mode">
+        <button
+          type="button"
+          role="tab"
+          class="view-toggle-btn"
+          class:active={viewMode === 'simple'}
+          aria-selected={viewMode === 'simple'}
+          onclick={() => setViewMode('simple')}
+        >
+          Simple
+        </button>
+        <button
+          type="button"
+          role="tab"
+          class="view-toggle-btn"
+          class:active={viewMode === 'advanced'}
+          aria-selected={viewMode === 'advanced'}
+          onclick={() => setViewMode('advanced')}
+        >
+          Advanced
+        </button>
+      </div>
+    </div>
+  </header>
 
+  <div class="app-body">
+    {#if viewMode === 'simple'}
+      <section class="simple-view" aria-label="Simple voice conversation">
+        <div class="simple-stage">
+          {#if !isReady && !isLoadingModels}
+            <button
+              type="button"
+              class="btn primary simple-load"
+              onclick={loadModels}
+              disabled={!workersReady || !sessionHydrated || isThinking || isSpeaking}
+            >
+              Start
+            </button>
+          {:else if isLoadingModels}
+            <p class="simple-caption">Loading models…</p>
+          {/if}
+          <SimpleVoiceGraphic mode={simpleGraphicMode} />
+        </div>
+        {#if error}
+          <p class="alert simple-alert">{error}</p>
+        {/if}
+        {#if !speechSupported}
+          <p class="alert simple-alert">Chrome SpeechRecognition is not available in this browser.</p>
+        {/if}
+      </section>
+    {:else}
     <section class="panel system-prompt">
       <div class="system-prompt-head">
         <span class="label">System prompt</span>
@@ -729,7 +919,7 @@
     <section class="panel controls">
       <div class="control-row">
         <label class="field">
-          <span class="label">Bonsai model</span>
+          <span class="label">Language model</span>
           <select
             bind:value={modelId}
             disabled={isLoadingModels || isThinking || isSpeaking || isListening}
@@ -757,7 +947,7 @@
             type="button"
             class="btn primary"
             onclick={loadModels}
-            disabled={isLoadingModels || isThinking || isSpeaking || isReady}
+            disabled={!workersReady || !sessionHydrated || isLoadingModels || isThinking || isSpeaking || isReady}
           >
             {#if isLoadingModels}
               <span class="spinner" aria-hidden="true"></span>
@@ -770,7 +960,12 @@
       <div class="status-bar">
         <div class="status-main">
           <div class="mic-icon" class:active={isListening} aria-hidden="true">
-            {isListening ? '🎤' : '🎙️'}
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" y1="19" x2="12" y2="23" />
+              <line x1="8" y1="23" x2="16" y2="23" />
+            </svg>
           </div>
           <div>
             <p class="status-text">{status}</p>
@@ -811,8 +1006,14 @@
       <div class="panel">
         <span class="label">Audio output</span>
         <p class="audio-out" class:speaking={isSpeaking}>
-          <span aria-hidden="true">{isSpeaking ? '🔊' : '🔈'}</span>
-          {isSpeaking ? "Speaking Bonsai's reply..." : 'Supertonic output plays here automatically.'}
+          <span class="audio-icon" aria-hidden="true">
+            {#if isSpeaking}
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M11 5L6 9H2v6h4l5 4V5zm8.5 3.5a9 9 0 0 1 0 7" stroke="currentColor" stroke-width="2" fill="none"/></svg>
+            {:else}
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>
+            {/if}
+          </span>
+          {isSpeaking ? 'Speaking reply…' : 'Audio plays automatically after each reply.'}
         </p>
       </div>
     </section>
@@ -858,13 +1059,23 @@
       <div class="messages">
         {#if turns.length === 0}
           <p class="placeholder">
-            Once started, every 500ms pause commits your latest spoken phrase to the full Bonsai conversation.
+            Your assistant will greet you first, then listen after every 500ms pause in your speech.
           </p>
         {:else}
           {#each turns as turn (turn.id)}
             <div class="turn">
-              <div class="bubble user">{turn.userText}</div>
+              {#if turn.userText.trim()}
+                <div class="bubble user">{turn.userText}</div>
+              {/if}
               <div class="bubble assistant">
+                <div class="assistant-row">
+                  <span class="avatar" aria-hidden="true">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <circle cx="12" cy="8" r="4" />
+                      <path d="M4 20c0-4 4-6 8-6s8 2 8 6" />
+                    </svg>
+                  </span>
+                  <div class="assistant-body">
                 {#if turn.assistantText || responseTextTab[turn.id]}
                   <div class="response-tabs" role="tablist" aria-label="Response text view">
                     <button
@@ -912,7 +1123,7 @@
                     </p>
                   {/if}
                 {:else}
-                  <p class="bubble-text">Thinking...</p>
+                  <p class="bubble-text thinking">Thinking…</p>
                 {/if}
                 {#if turn.assistantText}
                   {#if speakingTurnId === turn.id && isSpeaking}
@@ -922,7 +1133,7 @@
                       onclick={stopSpeaking}
                       aria-label="Stop playback"
                     >
-                      ■ Stop
+                      Stop
                     </button>
                   {:else}
                     <button
@@ -932,36 +1143,220 @@
                       disabled={!isReady || isThinking || isSpeaking}
                       aria-label="Play assistant reply"
                     >
-                      ▶ Play
+                      Play
                     </button>
                   {/if}
                 {/if}
+                  </div>
+                </div>
               </div>
             </div>
           {/each}
         {/if}
       </div>
     </section>
+    {/if}
   </div>
 </main>
 
 <style>
-  .page {
+  .app {
     min-height: 100vh;
-    padding: 1.25rem 1rem 3rem;
+    display: flex;
+    flex-direction: column;
+    background:
+      radial-gradient(ellipse 80% 50% at 50% -20%, rgba(16, 163, 127, 0.08), transparent),
+      var(--bg);
   }
 
-  .container {
-    max-width: 56rem;
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    border-bottom: 1px solid var(--border);
+    background: rgba(13, 13, 13, 0.82);
+    backdrop-filter: blur(12px);
+  }
+
+  .topbar-inner {
+    max-width: 52rem;
     margin: 0 auto;
+    padding: 0.875rem 1.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-width: 0;
+  }
+
+  .brand-mark {
+    width: 2rem;
+    height: 2rem;
     display: grid;
-    gap: 1.75rem;
+    place-items: center;
+    border-radius: var(--radius-md);
+    background: linear-gradient(145deg, var(--accent), #0d8c6d);
+    color: white;
+    flex-shrink: 0;
+  }
+
+  .brand-mark svg {
+    display: block;
+  }
+
+  .brand-copy {
+    display: grid;
+    gap: 0.05rem;
+    min-width: 0;
+  }
+
+  .brand-name {
+    font-size: 0.95rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--text);
+  }
+
+  .brand-tagline {
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+  }
+
+  .view-toggle {
+    display: inline-flex;
+    padding: 0.2rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    background: var(--bg-muted);
+    flex-shrink: 0;
+  }
+
+  .view-toggle-btn {
+    min-height: 2rem;
+    padding: 0 0.9rem;
+    border: none;
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 0.8125rem;
+    font-weight: 500;
+  }
+
+  .view-toggle-btn.active {
+    background: var(--bg-elevated);
+    color: var(--text);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .app-body {
+    flex: 1;
+    width: 100%;
+    max-width: 52rem;
+    margin: 0 auto;
+    padding: 1.5rem 1.25rem 3rem;
+    display: grid;
+    gap: 1rem;
+    align-content: start;
+  }
+
+  .simple-view {
+    display: grid;
+    place-items: center;
+    min-height: calc(100vh - 8rem);
+    padding: 1rem 0 2rem;
+  }
+
+  .simple-stage {
+    display: grid;
+    gap: 1.5rem;
+    justify-items: center;
+  }
+
+  .simple-load {
+    min-width: 10rem;
+    min-height: 2.75rem;
+    padding: 0 1.75rem;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    border-radius: var(--radius-full);
+    box-shadow: var(--shadow-md);
+  }
+
+  .simple-caption {
+    margin: 0;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+  }
+
+  .simple-alert {
+    margin-top: 1rem;
+    max-width: 24rem;
+    text-align: center;
+  }
+
+  .panel {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    background: var(--bg-elevated);
+    padding: 1rem 1.125rem;
+  }
+
+  .system-prompt-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.625rem;
+  }
+
+  .system-prompt-input {
+    width: 100%;
+    min-height: 7rem;
+    padding: 0.875rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-muted);
+    color: var(--text);
+    resize: vertical;
+    line-height: 1.55;
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+  }
+
+  .system-prompt-input:disabled {
+    opacity: 0.55;
+  }
+
+  .system-prompt-hint {
+    margin: 0.5rem 0 0;
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+  }
+
+  .btn.text {
+    min-height: auto;
+    padding: 0.35rem 0.5rem;
+    background: transparent;
+    border: none;
+    color: var(--accent);
+    font-size: 0.8125rem;
+    font-weight: 500;
+  }
+
+  .btn.text:disabled {
+    color: var(--text-tertiary);
   }
 
   .break-speech-bar {
     display: grid;
     gap: 0.75rem;
-    padding: 0.75rem 1rem;
+    padding: 0.875rem 1.125rem;
   }
 
   @media (min-width: 640px) {
@@ -979,90 +1374,6 @@
     flex-shrink: 0;
   }
 
-  .hero {
-    text-align: center;
-  }
-
-  .eyebrow {
-    margin: 0;
-    font-size: 0.75rem;
-    font-weight: 600;
-    letter-spacing: 0.22em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-
-  h1 {
-    margin: 0.5rem 0 0;
-    font-size: clamp(2rem, 5vw, 2.5rem);
-    font-weight: 500;
-    letter-spacing: -0.04em;
-    color: rgba(244, 236, 222, 0.85);
-  }
-
-  .lede {
-    margin: 0.75rem 0 0;
-    color: var(--muted);
-    font-size: 0.95rem;
-  }
-
-  .panel {
-    border: 1px solid var(--border);
-    border-radius: 1.25rem;
-    background: var(--surface-raised);
-    padding: 1rem;
-  }
-
-  .controls {
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
-  }
-
-  .system-prompt-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.75rem;
-    margin-bottom: 0.5rem;
-  }
-
-  .system-prompt-input {
-    width: 100%;
-    min-height: 7rem;
-    padding: 0.75rem;
-    border: 1px solid var(--border);
-    border-radius: 0.75rem;
-    background: var(--surface);
-    color: var(--cream);
-    resize: vertical;
-    line-height: 1.5;
-    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-    font-size: 0.85rem;
-  }
-
-  .system-prompt-input:disabled {
-    opacity: 0.65;
-  }
-
-  .system-prompt-hint {
-    margin: 0.5rem 0 0;
-    font-size: 0.75rem;
-    color: var(--muted);
-  }
-
-  .btn.text {
-    min-height: auto;
-    padding: 0.25rem 0.5rem;
-    background: transparent;
-    border: none;
-    color: var(--amber);
-    font-size: 0.75rem;
-    font-weight: 600;
-  }
-
-  .btn.text:disabled {
-    color: var(--muted);
-  }
-
   .control-row {
     display: grid;
     gap: 0.75rem;
@@ -1077,23 +1388,24 @@
 
   .field {
     display: grid;
-    gap: 0.35rem;
+    gap: 0.4rem;
   }
 
   .label {
-    font-size: 0.625rem;
+    font-size: 0.6875rem;
     font-weight: 600;
-    letter-spacing: 0.2em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
-    color: var(--muted);
+    color: var(--text-tertiary);
   }
 
   select {
     width: 100%;
-    height: 2.75rem;
+    height: 2.5rem;
     padding: 0 0.75rem;
     border: 1px solid var(--border);
-    background: var(--surface);
+    background: var(--bg-muted);
+    font-size: 0.875rem;
   }
 
   .actions {
@@ -1107,48 +1419,60 @@
     align-items: center;
     justify-content: center;
     gap: 0.4rem;
-    min-height: 2.75rem;
+    min-height: 2.5rem;
     padding: 0 1rem;
     border: 1px solid transparent;
-    font-size: 0.9rem;
-    font-weight: 600;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border-radius: var(--radius-md);
   }
 
   .btn.primary {
-    background: var(--amber);
-    color: #1a1208;
+    background: var(--text);
+    color: var(--bg);
+  }
+
+  .btn.primary:hover:not(:disabled) {
+    background: #ffffff;
   }
 
   .btn.outline {
     background: transparent;
-    border-color: var(--border);
-    color: var(--cream);
+    border-color: var(--border-strong);
+    color: var(--text);
+  }
+
+  .btn.outline:hover:not(:disabled) {
+    background: var(--bg-hover);
   }
 
   .btn.play {
-    margin-top: 0.5rem;
-    min-height: 2rem;
-    padding: 0 0.65rem;
+    margin-top: 0.625rem;
+    min-height: 1.875rem;
+    padding: 0 0.75rem;
     font-size: 0.75rem;
-    background: rgba(232, 165, 94, 0.15);
-    border-color: var(--border);
-    color: var(--cream);
+    background: var(--bg-muted);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    border-radius: var(--radius-full);
+  }
+
+  .btn.play:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text);
   }
 
   .btn.play.stop {
-    background: rgba(232, 94, 94, 0.15);
+    background: var(--danger-soft);
+    border-color: rgba(239, 68, 68, 0.2);
     color: var(--danger);
-  }
-
-  .btn.play:disabled {
-    opacity: 0.5;
   }
 
   .spinner {
     width: 1rem;
     height: 1rem;
-    border: 2px solid rgba(26, 18, 8, 0.2);
-    border-top-color: #1a1208;
+    border: 2px solid rgba(0, 0, 0, 0.15);
+    border-top-color: var(--bg);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
@@ -1160,58 +1484,63 @@
   }
 
   .status-bar {
-    margin-top: 1rem;
+    margin-top: 0.875rem;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 0.75rem;
-    padding: 0.75rem;
+    padding: 0.875rem 1rem;
     border: 1px solid var(--border);
-    border-radius: 1rem;
-    background: rgba(20, 17, 15, 0.55);
+    border-radius: var(--radius-lg);
+    background: var(--bg-muted);
   }
 
   .status-main {
     display: flex;
     align-items: center;
     gap: 0.75rem;
+    min-width: 0;
   }
 
   .mic-icon {
-    width: 2.75rem;
-    height: 2.75rem;
+    width: 2.5rem;
+    height: 2.5rem;
     display: grid;
     place-items: center;
-    border-radius: 1rem;
-    background: rgba(232, 165, 94, 0.15);
-    font-size: 1.25rem;
+    border-radius: var(--radius-md);
+    background: var(--bg-hover);
+    color: var(--text-secondary);
+    flex-shrink: 0;
   }
 
   .mic-icon.active {
-    background: var(--amber);
+    background: var(--accent-soft);
+    color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent-ring);
   }
 
   .status-text {
     margin: 0;
-    font-size: 0.9rem;
-    font-weight: 600;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text);
   }
 
   .status-sub {
-    margin: 0.15rem 0 0;
+    margin: 0.1rem 0 0;
     font-size: 0.75rem;
-    color: var(--muted);
+    color: var(--text-tertiary);
   }
 
   .alert {
     margin: 0.75rem 0 0;
-    padding: 0.65rem 0.75rem;
-    border-radius: 0.75rem;
-    border: 1px solid rgba(232, 94, 94, 0.25);
+    padding: 0.75rem 0.875rem;
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(239, 68, 68, 0.2);
     background: var(--danger-soft);
-    color: var(--danger);
-    font-size: 0.875rem;
+    color: #fca5a5;
+    font-size: 0.8125rem;
   }
 
   .grid.two-col {
@@ -1226,39 +1555,62 @@
   }
 
   .heard {
-    margin: 0.75rem 0 0;
-    min-height: 5rem;
-    font-size: 1.25rem;
-    line-height: 2rem;
-    color: rgba(244, 236, 222, 0.8);
+    margin: 0.625rem 0 0;
+    min-height: 4.5rem;
+    font-size: 1.0625rem;
+    line-height: 1.65;
+    color: var(--text);
+    font-weight: 400;
   }
 
   .audio-out {
-    margin: 0.75rem 0 0;
-    min-height: 5rem;
+    margin: 0.625rem 0 0;
+    min-height: 4.5rem;
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-    color: var(--muted);
-    font-size: 0.9rem;
+    gap: 0.625rem;
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+  }
+
+  .audio-icon {
+    display: grid;
+    place-items: center;
+    width: 2rem;
+    height: 2rem;
+    border-radius: var(--radius-md);
+    background: var(--bg-muted);
+    color: var(--text-tertiary);
+    flex-shrink: 0;
   }
 
   .audio-out.speaking {
-    color: var(--cream);
-    animation: pulse 1.2s ease-in-out infinite;
+    color: var(--text);
+  }
+
+  .audio-out.speaking .audio-icon {
+    background: var(--accent-soft);
+    color: var(--accent);
+    animation: pulse 1.4s ease-in-out infinite;
   }
 
   @keyframes pulse {
     50% {
-      opacity: 0.65;
+      opacity: 0.55;
     }
+  }
+
+  .conversation {
+    padding-bottom: 1.25rem;
   }
 
   .conversation-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 0.75rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border);
   }
 
   .conversation-head-actions {
@@ -1269,34 +1621,36 @@
 
   .turn-count {
     font-size: 0.75rem;
-    color: var(--muted);
+    color: var(--text-tertiary);
   }
 
   .messages {
     display: grid;
-    gap: 1rem;
+    gap: 1.5rem;
   }
 
   .turn {
     display: grid;
-    gap: 0.5rem;
+    gap: 0.75rem;
   }
 
   .placeholder {
     margin: 0;
-    padding: 1rem;
-    border-radius: 0.75rem;
-    background: rgba(20, 17, 15, 0.5);
-    color: var(--muted);
+    padding: 1.25rem;
+    border-radius: var(--radius-lg);
+    background: var(--bg-muted);
+    color: var(--text-secondary);
     font-size: 0.875rem;
+    text-align: center;
+    line-height: 1.6;
   }
 
   .bubble {
-    max-width: 80%;
+    max-width: min(85%, 28rem);
     padding: 0.75rem 1rem;
-    border-radius: 1rem;
-    font-size: 0.875rem;
-    line-height: 1.5;
+    border-radius: var(--radius-xl);
+    font-size: 0.9375rem;
+    line-height: 1.6;
   }
 
   .bubble-text {
@@ -1304,18 +1658,22 @@
     white-space: pre-wrap;
   }
 
+  .bubble-text.thinking {
+    color: var(--text-secondary);
+  }
+
   .bubble-text.prompt-text {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
-    font-size: 0.8rem;
-    line-height: 1.45;
-    color: rgba(244, 236, 222, 0.88);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
   }
 
   .response-editor {
     display: block;
     width: 100%;
     box-sizing: border-box;
-    min-height: 6rem;
+    min-height: 5rem;
     padding: 0;
     border: 0;
     outline: 0;
@@ -1323,59 +1681,88 @@
     background: transparent;
     color: inherit;
     font: inherit;
+    line-height: 1.6;
   }
 
   .response-editor:disabled {
-    opacity: 0.75;
+    opacity: 0.6;
     cursor: not-allowed;
   }
 
   .bubble.user {
     margin-left: auto;
-    background: var(--amber);
-    color: #1a1208;
+    background: var(--user-bubble);
+    color: var(--text);
+    border-bottom-right-radius: var(--radius-sm);
   }
 
   .bubble.assistant {
     width: 100%;
     max-width: 100%;
-    box-sizing: border-box;
-    margin-right: auto;
-    border: 1px solid var(--border);
-    background: var(--surface);
+    padding: 0;
+    border: none;
+    background: transparent;
+    border-radius: 0;
+  }
+
+  .assistant-row {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.875rem;
+    align-items: start;
+    width: 100%;
+  }
+
+  .avatar {
+    width: 1.75rem;
+    height: 1.75rem;
+    display: grid;
+    place-items: center;
+    border-radius: var(--radius-md);
+    background: linear-gradient(145deg, var(--accent), #0d8c6d);
+    color: white;
+    flex-shrink: 0;
+    margin-top: 0.1rem;
+  }
+
+  .avatar svg {
+    display: block;
+  }
+
+  .assistant-body {
+    min-width: 0;
+    padding-top: 0.05rem;
   }
 
   .response-tabs {
-    display: flex;
-    gap: 0.35rem;
-    margin-bottom: 0.65rem;
+    display: inline-flex;
+    gap: 0.2rem;
+    margin-bottom: 0.625rem;
     padding: 0.2rem;
-    border-radius: 0.65rem;
-    background: rgba(20, 17, 15, 0.45);
+    border-radius: var(--radius-md);
+    background: var(--bg-muted);
+    border: 1px solid var(--border);
   }
 
   .response-tab {
-    flex: 1;
-    padding: 0.35rem 0.55rem;
+    padding: 0.35rem 0.65rem;
     border: 0;
-    border-radius: 0.5rem;
+    border-radius: calc(var(--radius-md) - 2px);
     background: transparent;
-    color: var(--muted);
+    color: var(--text-tertiary);
     font: inherit;
     font-size: 0.75rem;
-    font-weight: 600;
+    font-weight: 500;
     cursor: pointer;
-    transition:
-      background 0.15s ease,
-      color 0.15s ease;
   }
 
   .response-tab:hover {
-    color: var(--cream);
+    color: var(--text-secondary);
   }
 
   .response-tab.active {
-    background: rgba(232, 165, 94, 0.18);
-    color: var(--cream);
+    background: var(--bg-elevated);
+    color: var(--text);
+    box-shadow: var(--shadow-sm);
   }
 </style>

@@ -4,9 +4,9 @@ export const PAUSE_MS = 500;
 export const POST_TTS_COOLDOWN_MS = 800;
 
 export const MODELS = [
-  { id: '1.7b', name: 'Bonsai 1.7B', size: '470 MB' },
-  { id: '4b', name: 'Bonsai 4B', size: '1.1 GB' },
-  { id: '8b', name: 'Bonsai 8B', size: '2.2 GB' },
+  { id: '1.7b', name: '1.7B', size: '470 MB' },
+  { id: '4b', name: '4B', size: '1.1 GB' },
+  { id: '8b', name: '8B', size: '2.2 GB' },
 ] as const;
 
 export const VOICES = ['F1', 'F2', 'F3', 'F4', 'F5', 'M1', 'M2', 'M3', 'M4', 'M5'] as const;
@@ -111,6 +111,9 @@ export type WorkerMessage = {
   role: WorkerRole;
   content: string;
 };
+
+export const OPENING_USER_MESSAGE =
+  'Begin the conversation. Speak first with your opening line.';
 
 export const DEFAULT_SYSTEM_PROMPT = `You are a friendly and helpful AI assistant who enjoys conversations.
 
@@ -234,6 +237,18 @@ function buildBonsaiUserPrompt(prior: WorkerMessage[], latest: WorkerMessage): s
   ].join('\n');
 }
 
+export function needsOpeningGreeting(turns: ConversationTurn[]): boolean {
+  if (turns.some((turn) => turn.assistantText.trim())) return false;
+  if (turns.length === 0) return true;
+  return turns.every((turn) => !turn.userText.trim());
+}
+
+export function buildOpeningWorkerMessages(systemPrompt: string): WorkerMessage[] {
+  return buildWorkerMessages(systemPrompt, [
+    { id: 'opening', role: 'user', content: OPENING_USER_MESSAGE },
+  ]);
+}
+
 export function buildWorkerMessages(systemPrompt: string, messages: ChatMessage[]): WorkerMessage[] {
   const chat = workerMessages(messages);
   const system: WorkerMessage = {
@@ -323,7 +338,9 @@ export function turnsToChatMessages(turns: ConversationTurn[]): ChatMessage[] {
 export function turnsToWorkerMessages(turns: ConversationTurn[]): ChatMessage[] {
   const messages: ChatMessage[] = [];
   for (const turn of turns) {
-    messages.push({ id: `${turn.id}-user`, role: 'user', content: turn.userText });
+    if (turn.userText.trim()) {
+      messages.push({ id: `${turn.id}-user`, role: 'user', content: turn.userText });
+    }
     if (turn.assistantText) {
       messages.push({ id: `${turn.id}-assistant`, role: 'assistant', content: turn.assistantText });
     }
@@ -337,10 +354,17 @@ export function turnsToWorkerMessagesForTurn(turns: ConversationTurn[], turnInde
   for (let i = 0; i <= turnIndex; i++) {
     const turn = turns[i];
     if (!turn) continue;
-    messages.push({ id: `${turn.id}-user`, role: 'user', content: turn.userText });
-    if (i < turnIndex && turn.assistantText) {
-      messages.push({ id: `${turn.id}-assistant`, role: 'assistant', content: turn.assistantText });
+    if (i < turnIndex) {
+      if (turn.userText.trim()) {
+        messages.push({ id: `${turn.id}-user`, role: 'user', content: turn.userText });
+      }
+      if (turn.assistantText) {
+        messages.push({ id: `${turn.id}-assistant`, role: 'assistant', content: turn.assistantText });
+      }
+      continue;
     }
+    const userContent = turn.userText.trim() || OPENING_USER_MESSAGE;
+    messages.push({ id: `${turn.id}-user`, role: 'user', content: userContent });
   }
   return messages;
 }
@@ -378,8 +402,17 @@ export function ttsLangForText(text: string, lang: TtsLanguage): TtsLanguage {
   return 'en';
 }
 
+/** Strip dialogue role prefixes the model sometimes echoes in replies. */
+export function normaliseAssistantOutput(input: string): string {
+  let text = input.trim();
+  while (/^You:\s*/i.test(text)) {
+    text = text.replace(/^You:\s*/i, '').trimStart();
+  }
+  return text;
+}
+
 export function normaliseForSupertonic(input: string): string {
-  let text = input
+  let text = normaliseAssistantOutput(input)
     .normalize('NFKC')
 
     // Pull block-style expression tags onto the same line as the text that follows.
@@ -518,7 +551,7 @@ export function formatBytes(value: number | undefined) {
 }
 
 export function modelName(id: ModelId) {
-  return MODELS.find((m) => m.id === id)?.name ?? 'Bonsai';
+  return MODELS.find((m) => m.id === id)?.name ?? 'Model';
 }
 
 function normalizeSpeech(text: string) {
